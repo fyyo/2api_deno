@@ -4268,7 +4268,11 @@ await initKV();
     console.log(`🔐 登录账号: ${AUTH_USERNAME}`);
     console.log(`🔑 登录密码: ${AUTH_PASSWORD}`);
     console.log(`💡 访问 /login 登录管理界面`);
-await serve(handler, { port: PORT });
+    console.log(`🌐 监听地址: 0.0.0.0:${PORT}`);
+await serve(handler, { 
+  port: Number(PORT),
+  hostname: "0.0.0.0"  // 监听所有接口，Deno Deploy 需要
+});
 
 /*
   📦 源码地址:
