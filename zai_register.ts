@@ -86,12 +86,10 @@ async function initKV() {
     console.log("✅ KV数据库连接成功");
   } catch (error) {
     console.error("❌ KV初始化失败:", error);
-    console.error("⚠️ 请确保已在 Deno Deploy 中创建 KV 数据库");
-    console.error("   1. 在 Deno Deploy 控制台创建 KV 数据库");
-    console.error("   2. 将数据库分配给应用程序");
     throw new Error("KV初始化失败");
   }
 }
+
 
 // ==================== 全局状态 ====================
 
@@ -4254,14 +4252,16 @@ await initKV();
     console.log("✓ 已加载保存的配置");
   }
 
-  // 清理历史日志（重启时清空）
-  const logKey = ["logs", "recent"];
-  try {
-    await kvDelete(logKey);
-    console.log("✓ 已清理历史日志数据");
-  } catch (error) {
-    console.log("⚠️ 清理日志失败:", error);
-  }
+  // 清理历史日志（异步执行，不阻塞启动）
+  setTimeout(async () => {
+    try {
+      const logKey = ["logs", "recent"];
+      await kvDelete(logKey);
+      console.log("✓ 已清理历史日志数据");
+    } catch (error) {
+      console.log("⚠️ 清理日志失败:", error);
+    }
+  }, 2000); // 延迟2秒执行
 })();
 
     console.log(`🚀 Z.AI 管理系统 V2 启动成功`);
