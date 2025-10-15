@@ -9,7 +9,7 @@ import { serve } from "https://deno.land/std@0.208.0/http/server.ts";
 
 // ==================== 配置区域 ====================
 
-const PORT = 8001;  // 端口
+const PORT = Deno.env.get("PORT") || 8001;  // 端口，Deno Deploy会自动设置PORT
 const NOTIFY_INTERVAL = 3600;  // 通知间隔秒
 const MAX_LOGIN_ATTEMPTS = 5;  // 最大登录失败
 const LOGIN_LOCK_DURATION = 900000;  // 锁定15分钟
@@ -83,10 +83,12 @@ async function kvDelete(key: Deno.KvKey) {
 async function initKV() {
   try {
     kv = await Deno.openKv();
+    console.log("✅ KV数据库连接成功");
   } catch (error) {
     console.error("❌ KV初始化失败:", error);
-    console.error("⚠️ 需要--unstable-kv标志");
-    console.error("   运行: deno run --allow-net --allow-env --allow-read --unstable-kv zai_register.ts");
+    console.error("⚠️ 请确保已在 Deno Deploy 中创建 KV 数据库");
+    console.error("   1. 在 Deno Deploy 控制台创建 KV 数据库");
+    console.error("   2. 将数据库分配给应用程序");
     throw new Error("KV初始化失败");
   }
 }
@@ -3405,6 +3407,17 @@ const HTML_PAGE = `<!DOCTYPE html>
 async function handler(req: Request): Promise<Response> {
   const url = new URL(req.url);
 
+  // 健康检查端点（Deno Deploy 需要）
+  if (url.pathname === "/health" || url.pathname === "/") {
+    return new Response(JSON.stringify({
+      status: "ok",
+      timestamp: new Date().toISOString(),
+      service: "Z.AI Register Tool"
+    }), {
+      headers: { "Content-Type": "application/json" }
+    });
+  }
+
   // 登录页面（无需鉴权）
   if (url.pathname === "/login") {
     return new Response(LOGIN_PAGE, { headers: { "Content-Type": "text/html; charset=utf-8" } });
@@ -4251,10 +4264,10 @@ await initKV();
   }
 })();
 
-console.log(`🚀 Z.AI 管理系统 V2 启动: http://localhost:${PORT}`);
-console.log(`🔐 登录账号: ${AUTH_USERNAME}`);
-console.log(`🔑 登录密码: ${AUTH_PASSWORD}`);
-console.log(`💡 访问 http://localhost:${PORT}/login 登录`);
+    console.log(`🚀 Z.AI 管理系统 V2 启动成功`);
+    console.log(`🔐 登录账号: ${AUTH_USERNAME}`);
+    console.log(`🔑 登录密码: ${AUTH_PASSWORD}`);
+    console.log(`💡 访问 /login 登录管理界面`);
 await serve(handler, { port: PORT });
 
 /*
