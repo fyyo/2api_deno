@@ -30,7 +30,7 @@ const DOMAINS = [
 // ==================== 数据存储 ====================
 
 // KV数据库
-let kv: Deno.Kv | any;
+let kv: Deno.Kv;
 
 // 配置缓存（内存）
 let configCache: any = null;
@@ -82,69 +82,13 @@ async function kvDelete(key: Deno.KvKey) {
 // 初始化KV
 async function initKV() {
   try {
-    // 检查 Deno.openKv 是否可用
-    if (typeof Deno.openKv === 'function') {
-      kv = await Deno.openKv();
-      console.log("✅ KV数据库连接成功");
-    } else {
-      // 回退到内存存储
-      console.log("⚠️ Deno.openKv 不可用，使用内存存储");
-      kv = createMemoryKV();
-    }
+    kv = await Deno.openKv();
   } catch (error) {
     console.error("❌ KV初始化失败:", error);
-    console.log("⚠️ 回退到内存存储模式");
-    kv = createMemoryKV();
+    console.error("⚠️ 需要--unstable-kv标志");
+    console.error("   运行: deno run --allow-net --allow-env --allow-read --unstable-kv zai_register.ts");
+    throw new Error("KV初始化失败");
   }
-}
-
-// 创建内存KV实现
-function createMemoryKV() {
-  const store = new Map<string, { value: any; expireAt?: number }>();
-  
-  // 定时清理过期数据
-  setInterval(() => {
-    const now = Date.now();
-    let cleaned = 0;
-    for (const [key, item] of store.entries()) {
-      if (item.expireAt && now > item.expireAt) {
-        store.delete(key);
-        cleaned++;
-      }
-    }
-    if (cleaned > 0) {
-      console.log(`🧹 清理了 ${cleaned} 个过期数据项`);
-    }
-  }, 60000); // 每分钟清理一次
-  
-  return {
-    async get(key: Deno.KvKey) {
-      const keyStr = JSON.stringify(key);
-      const item = store.get(keyStr);
-      
-      if (!item) return { value: null };
-      
-      // 检查是否过期
-      if (item.expireAt && Date.now() > item.expireAt) {
-        store.delete(keyStr);
-        return { value: null };
-      }
-      
-      return { value: item.value };
-    },
-    
-    async set(key: Deno.KvKey, value: any, options?: { expireIn?: number }) {
-      const keyStr = JSON.stringify(key);
-      const expireAt = options?.expireIn ? Date.now() + options.expireIn : undefined;
-      store.set(keyStr, { value, expireAt });
-      return { ok: true };
-    },
-    
-    async delete(key: Deno.KvKey) {
-      const keyStr = JSON.stringify(key);
-      return store.delete(keyStr);
-    }
-  };
 }
 
 // ==================== 全局状态 ====================
