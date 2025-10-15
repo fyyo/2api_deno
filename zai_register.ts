@@ -82,11 +82,14 @@ async function kvDelete(key: Deno.KvKey) {
 // 初始化KV
 async function initKV() {
   try {
+    // 在 Deno Deploy 中，Deno.openKv() 会自动连接到 KV Cloud
     kv = await Deno.openKv();
+    console.log("✅ KV数据库连接成功");
   } catch (error) {
     console.error("❌ KV初始化失败:", error);
-    console.error("⚠️ 需要--unstable-kv标志");
-    console.error("   运行: deno run --allow-net --allow-env --allow-read --unstable-kv zai_register.ts");
+    console.error("⚠️ 请确保已在 Deno Deploy 中创建 KV 数据库");
+    console.error("   1. 在 Deno Deploy 控制台创建 KV 数据库");
+    console.error("   2. 设置环境变量 DENO_KV_ACCESS_TOKEN 和 DENO_KV_DATABASE_ID");
     throw new Error("KV初始化失败");
   }
 }
