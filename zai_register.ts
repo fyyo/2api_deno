@@ -30,7 +30,7 @@ const DOMAINS = [
 // ==================== 数据存储 ====================
 
 // KV数据库
-let kv: Deno.Kv;
+let kv: Deno.Kv | any;
 
 // 配置缓存（内存）
 let configCache: any = null;
@@ -82,16 +82,69 @@ async function kvDelete(key: Deno.KvKey) {
 // 初始化KV
 async function initKV() {
   try {
-    // 在 Deno Deploy 中，Deno.openKv() 会自动连接到 KV Cloud
-    kv = await Deno.openKv();
-    console.log("✅ KV数据库连接成功");
+    // 检查 Deno.openKv 是否可用
+    if (typeof Deno.openKv === 'function') {
+      kv = await Deno.openKv();
+      console.log("✅ KV数据库连接成功");
+    } else {
+      // 回退到内存存储
+      console.log("⚠️ Deno.openKv 不可用，使用内存存储");
+      kv = createMemoryKV();
+    }
   } catch (error) {
     console.error("❌ KV初始化失败:", error);
-    console.error("⚠️ 请确保已在 Deno Deploy 中创建 KV 数据库");
-    console.error("   1. 在 Deno Deploy 控制台创建 KV 数据库");
-    console.error("   2. 设置环境变量 DENO_KV_ACCESS_TOKEN 和 DENO_KV_DATABASE_ID");
-    throw new Error("KV初始化失败");
+    console.log("⚠️ 回退到内存存储模式");
+    kv = createMemoryKV();
   }
+}
+
+// 创建内存KV实现
+function createMemoryKV() {
+  const store = new Map<string, { value: any; expireAt?: number }>();
+  
+  // 定时清理过期数据
+  setInterval(() => {
+    const now = Date.now();
+    let cleaned = 0;
+    for (const [key, item] of store.entries()) {
+      if (item.expireAt && now > item.expireAt) {
+        store.delete(key);
+        cleaned++;
+      }
+    }
+    if (cleaned > 0) {
+      console.log(`🧹 清理了 ${cleaned} 个过期数据项`);
+    }
+  }, 60000); // 每分钟清理一次
+  
+  return {
+    async get(key: Deno.KvKey) {
+      const keyStr = JSON.stringify(key);
+      const item = store.get(keyStr);
+      
+      if (!item) return { value: null };
+      
+      // 检查是否过期
+      if (item.expireAt && Date.now() > item.expireAt) {
+        store.delete(keyStr);
+        return { value: null };
+      }
+      
+      return { value: item.value };
+    },
+    
+    async set(key: Deno.KvKey, value: any, options?: { expireIn?: number }) {
+      const keyStr = JSON.stringify(key);
+      const expireAt = options?.expireIn ? Date.now() + options.expireIn : undefined;
+      store.set(keyStr, { value, expireAt });
+      return { ok: true };
+    },
+    
+    async delete(key: Deno.KvKey) {
+      const keyStr = JSON.stringify(key);
+      return store.delete(keyStr);
+    }
+  };
 }
 
 // ==================== 全局状态 ====================
