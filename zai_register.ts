@@ -4264,15 +4264,24 @@ await initKV();
   }, 2000); // 延迟2秒执行
 })();
 
-    console.log(`🚀 Z.AI 管理系统 V2 启动成功`);
-    console.log(`🔐 登录账号: ${AUTH_USERNAME}`);
-    console.log(`🔑 登录密码: ${AUTH_PASSWORD}`);
-    console.log(`💡 访问 /login 登录管理界面`);
-    console.log(`🌐 监听地址: 0.0.0.0:${PORT}`);
-await serve(handler, { 
-  port: Number(PORT),
-  hostname: "0.0.0.0"  // 监听所有接口，Deno Deploy 需要
-});
+console.log(`🚀 Z.AI 管理系统 V2 启动成功`);
+console.log(`🔐 登录账号: ${AUTH_USERNAME}`);
+console.log(`🔑 登录密码: ${AUTH_PASSWORD}`);
+console.log(`💡 访问 /login 登录管理界面`);
+
+// Deno Deploy 使用 Deno.serve 而不是 serve
+if (typeof Deno.serve === 'function') {
+  // Deno Deploy 环境
+  console.log(`🌐 Deno Deploy 模式`);
+  Deno.serve(handler);
+} else {
+  // 本地开发环境
+  console.log(`🌐 本地开发模式 - 监听 0.0.0.0:${PORT}`);
+  await serve(handler, { 
+    port: Number(PORT),
+    hostname: "0.0.0.0"
+  });
+}
 
 /*
   📦 源码地址:
