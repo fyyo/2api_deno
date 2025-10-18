@@ -755,7 +755,7 @@ app.use(router.routes());
 app.use(router.allowedMethods());
 
 // 启动服务器
-const port = 3600;
+const port = 3000;
 console.log(`🚀 服务器运行在 http://localhost:${port}`);
 console.log(`📚 Enginelabs-2API-V3 Deno 版本 v3.0.0`);
 await app.listen({ port });
