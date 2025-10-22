@@ -118,7 +118,7 @@ function extractLatestUserContent(messages: any[]): string {
 async function makeUpstreamRequest(messages: any[], model: string) {
   const token = await getToken();
   const payload = decodeJwtPayload(token);
-  const userId = payload.id;
+  const userId = payload.id || `guest-user-${Math.abs(token.split("").reduce((s, c) => Math.imul(31, s) + c.charCodeAt(0) | 0, 0)) % 1000000}`;
   const chatId = crypto.randomUUID();
   const timestamp = Date.now();
   const requestId = crypto.randomUUID();
@@ -134,14 +134,65 @@ async function makeUpstreamRequest(messages: any[], model: string) {
     userId
   );
 
+  // 调试：打印签名相关信息
+  console.log("[Signature Debug]");
+  console.log("  User Content:", latestUserContent.substring(0, 50));
+  console.log("  Request ID:", requestId);
+  console.log("  Timestamp:", timestamp);
+  console.log("  User ID:", userId);
+  console.log("  Signature:", signature);
+
+  // 生成时间字符串
+  const now = new Date();
+  const localTime = new Date(now.toLocaleString("en-US", { timeZone: "Asia/Shanghai" }));
+  const localTimeStr = `${localTime.getFullYear()}-${String(localTime.getMonth() + 1).padStart(2, "0")}-${String(localTime.getDate()).padStart(2, "0")}T${String(localTime.getHours()).padStart(2, "0")}:${String(localTime.getMinutes()).padStart(2, "0")}:${String(localTime.getSeconds()).padStart(2, "0")}.${String(localTime.getMilliseconds()).padStart(3, "0")}Z`;
+  const utcTime = now.toUTCString();
+
+  // 构建完整的查询参数（模拟真实浏览器）
   const url = new URL("https://chat.z.ai/api/chat/completions");
-  url.searchParams.set("timestamp", timestamp.toString());
-  url.searchParams.set("requestId", requestId);
-  url.searchParams.set("user_id", userId);
-  url.searchParams.set("token", token);
-  url.searchParams.set("current_url", `https://chat.z.ai/c/${chatId}`);
-  url.searchParams.set("pathname", `/c/${chatId}`);
-  url.searchParams.set("signature_timestamp", timestamp.toString());
+  const queryParams: Record<string, string> = {
+    timestamp: timestamp.toString(),
+    requestId: requestId,
+    user_id: userId,
+    version: "0.0.1",
+    platform: "web",
+    token: token,
+    user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    language: "zh-CN",
+    languages: "zh-CN,zh",
+    timezone: "Asia/Shanghai",
+    cookie_enabled: "true",
+    screen_width: "2048",
+    screen_height: "1152",
+    screen_resolution: "2048x1152",
+    viewport_height: "654",
+    viewport_width: "1038",
+    viewport_size: "1038x654",
+    color_depth: "24",
+    pixel_ratio: "1.25",
+    current_url: `https://chat.z.ai/c/${chatId}`,
+    pathname: `/c/${chatId}`,
+    search: "",
+    hash: "",
+    host: "chat.z.ai",
+    hostname: "chat.z.ai",
+    protocol: "https:",
+    referrer: "",
+    title: "Z.ai Chat - Free AI powered by GLM-4.6 & GLM-4.5",
+    timezone_offset: "-480",
+    local_time: localTimeStr,
+    utc_time: utcTime,
+    is_mobile: "false",
+    is_touch: "false",
+    max_touch_points: "10",
+    browser_name: "Chrome",
+    os_name: "Windows",
+    signature_timestamp: timestamp.toString(),
+  };
+
+  for (const [key, value] of Object.entries(queryParams)) {
+    url.searchParams.set(key, value);
+  }
 
   const response = await fetch(url, {
     method: "POST",
@@ -173,9 +224,9 @@ async function makeUpstreamRequest(messages: any[], model: string) {
   });
 
   if (!response.ok) {
-    console.error(`[Upstream Error] Non-200 response, status: ${response.status}, statusText: ${response.statusText}`);
     const errorText = await response.text();
-    console.error(`[Upstream Error] Response body: ${errorText}`);
+    console.error(`[Upstream Error] ${response.status} ${response.statusText}: ${errorText}`);
+    throw new Error(`Upstream API error: ${response.status} - ${errorText}`);
   }
 
   return { response, model: targetModel };
@@ -192,12 +243,13 @@ async function handleModels(): Promise<Response> {
 }
 
 async function handleChatCompletions(req: Request): Promise<Response> {
-  const data = await req.json();
-  const messages = data.messages || [];
-  const model = data.model || "GLM-4.6";
-  const stream = data.stream || false;
+  try {
+    const data = await req.json();
+    const messages = data.messages || [];
+    const model = data.model || "GLM-4.6";
+    const stream = data.stream !== false; // 默认流式
 
-  const { response, model: modelName } = await makeUpstreamRequest(messages, model);
+    const { response, model: modelName } = await makeUpstreamRequest(messages, model);
 
   if (stream) {
     const reader = response.body?.getReader();
@@ -316,6 +368,21 @@ async function handleChatCompletions(req: Request): Promise<Response> {
         finish_reason: "stop"
       }],
     }), { headers: { "Content-Type": "application/json" } });
+  }
+  } catch (error) {
+    console.error("[Chat Completions Error]", error);
+    return new Response(
+      JSON.stringify({
+        error: {
+          message: error instanceof Error ? error.message : "Internal server error",
+          type: "internal_error",
+        },
+      }),
+      {
+        status: 500,
+        headers: { "Content-Type": "application/json" },
+      }
+    );
   }
 }
 
