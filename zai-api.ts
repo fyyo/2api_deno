@@ -1,4 +1,5 @@
 import { serve } from "https://deno.land/std@0.208.0/http/server.ts";
+import { encode as base64Encode } from "https://deno.land/std@0.208.0/encoding/base64.ts";
 
 // ========== 配置 ==========
 const CONFIG = {
@@ -6,7 +7,7 @@ const CONFIG = {
   SIGNING_SECRET: Deno.env.get("ZAI_SIGNING_SECRET") || "junjie",
   AUTH_ENDPOINT: Deno.env.get("ZAI_AUTH_ENDPOINT") || "https://chat.z.ai/api/v1/auths/",
   API_ENDPOINT: Deno.env.get("API_ENDPOINT") || "https://chat.z.ai/api/chat/completions",
-  LOG_LEVEL: (Deno.env.get("LOG_LEVEL") || "info").toLowerCase() as "false" | "info" | "debug",
+  LOG_LEVEL: (Deno.env.get("LOG_LEVEL") || "debug").toLowerCase() as "false" | "info" | "debug",  // 临时改为debug
   MAX_RETRIES: parseInt(Deno.env.get("MAX_RETRIES") || "3"),
   ENABLE_GUEST_TOKEN: (Deno.env.get("ENABLE_GUEST_TOKEN") || "true").toLowerCase() === "true",
 };
@@ -164,17 +165,14 @@ async function generateSignature(
   timestamp: number,
   userId: string
 ): Promise<string> {
-  // 1. Base64编码消息
+  // 1. Base64编码消息（使用Deno标准库，与Python保持一致）
   const message = messageText || "";
   const messageBytes = new TextEncoder().encode(message);
-  const messageBase64 = btoa(
-    Array.from(messageBytes)
-      .map(byte => String.fromCharCode(byte))
-      .join("")
-  );
+  const messageBase64 = base64Encode(messageBytes);
 
   debugLog("[签名] 步骤1 - Base64编码:");
   debugLog(`  原始消息: ${message.substring(0, 50)}${message.length > 50 ? "..." : ""}`);
+  debugLog(`  消息字节数: ${messageBytes.length}`);
   debugLog(`  Base64: ${messageBase64.substring(0, 50)}${messageBase64.length > 50 ? "..." : ""}`);
 
   // 2. 构建canonical string
@@ -282,7 +280,12 @@ async function makeUpstreamRequest(messages: any[], model: string) {
   const latestUserContent = extractLatestUserContent(messages);
   const features = detectModelFeatures(model);
 
-  debugLog(`开始构造上游请求: ${model} -> ${targetModel}`, features);
+  debugLog(`开始构造上游请求: ${model} -> ${targetModel}`);
+  debugLog(`模型特性:`, features);
+  debugLog(`用户内容: ${latestUserContent.substring(0, 100)}${latestUserContent.length > 100 ? "..." : ""}`);
+  debugLog(`请求ID: ${requestId}`);
+  debugLog(`时间戳: ${timestamp}`);
+  debugLog(`用户ID: ${userId}`);
 
   // 生成签名
   const signature = await generateSignature(
@@ -291,6 +294,8 @@ async function makeUpstreamRequest(messages: any[], model: string) {
     timestamp,
     userId
   );
+  
+  infoLog(`✅ 签名生成成功: ${signature.substring(0, 16)}...${signature.substring(signature.length - 8)}`);
 
   // 构建MCP服务器列表
   const mcpServers: string[] = [];
