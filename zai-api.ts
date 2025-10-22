@@ -173,24 +173,39 @@ async function generateSignature(
       .join("")
   );
 
+  debugLog("[签名] 步骤1 - Base64编码:");
+  debugLog(`  原始消息: ${message.substring(0, 50)}${message.length > 50 ? "..." : ""}`);
+  debugLog(`  Base64: ${messageBase64.substring(0, 50)}${messageBase64.length > 50 ? "..." : ""}`);
+
   // 2. 构建canonical string
   const a = `requestId,${requestId},timestamp,${timestamp},user_id,${userId}`;
   const canonicalString = `${a}|${messageBase64}|${timestamp}`;
 
+  debugLog("[签名] 步骤2 - Canonical String:");
+  debugLog(`  前缀: ${a}`);
+  debugLog(`  完整: ${canonicalString.substring(0, 100)}...`);
+
   // 3. 计算时间窗口（5分钟为一个窗口）
   const windowIndex = Math.floor(timestamp / (5 * 60 * 1000));
+
+  debugLog("[签名] 步骤3 - 时间窗口:");
+  debugLog(`  时间戳: ${timestamp}`);
+  debugLog(`  窗口索引: ${windowIndex}`);
 
   // 4. 第一层HMAC：生成派生密钥
   const derivedHex = await hmacSha256(CONFIG.SIGNING_SECRET, windowIndex.toString());
 
+  debugLog("[签名] 步骤4 - 第一层HMAC:");
+  debugLog(`  密钥: ${CONFIG.SIGNING_SECRET}`);
+  debugLog(`  数据: ${windowIndex.toString()}`);
+  debugLog(`  派生密钥: ${derivedHex.substring(0, 20)}...`);
+
   // 5. 第二层HMAC：生成最终签名
   const signature = await hmacSha256(derivedHex, canonicalString);
 
-  debugLog("签名生成完成:", {
-    windowIndex,
-    canonicalStringPreview: canonicalString.substring(0, 100),
-    signature: signature.substring(0, 20) + "...",
-  });
+  debugLog("[签名] 步骤5 - 第二层HMAC:");
+  debugLog(`  使用派生密钥签名canonical string`);
+  debugLog(`  最终签名: ${signature}`);
 
   return signature;
 }
@@ -709,11 +724,26 @@ async function handler(req: Request): Promise<Response> {
 }
 
 // ========== 导出 ==========
-export default { fetch: handler };
+// 启动时的配置信息（仅在首次请求时输出，避免重复）
+let isFirstRequest = true;
 
-// 启动日志
-infoLog("Z.AI OpenAI-Compatible API Server 已启动");
-infoLog(`前端版本: ${CONFIG.FE_VERSION}`);
-infoLog(`日志级别: ${CONFIG.LOG_LEVEL}`);
-infoLog(`最大重试次数: ${CONFIG.MAX_RETRIES}`);
-infoLog(`匿名Token: ${CONFIG.ENABLE_GUEST_TOKEN ? "启用" : "禁用"}`);
+function logStartupInfo() {
+  if (isFirstRequest) {
+    isFirstRequest = false;
+    infoLog("=".repeat(60));
+    infoLog("🚀 Z.AI OpenAI-Compatible API Server");
+    infoLog(`📌 前端版本: ${CONFIG.FE_VERSION}`);
+    infoLog(`📊 日志级别: ${CONFIG.LOG_LEVEL}`);
+    infoLog(`🔄 最大重试: ${CONFIG.MAX_RETRIES}`);
+    infoLog(`🎫 匿名Token: ${CONFIG.ENABLE_GUEST_TOKEN ? "✅ 启用" : "❌ 禁用"}`);
+    infoLog(`🌐 API地址: ${CONFIG.API_ENDPOINT}`);
+    infoLog("=".repeat(60));
+  }
+}
+
+async function wrappedHandler(req: Request): Promise<Response> {
+  logStartupInfo();
+  return await handler(req);
+}
+
+export default { fetch: wrappedHandler };
