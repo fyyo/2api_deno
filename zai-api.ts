@@ -1,430 +1,787 @@
-import { serve } from "https://deno.land/std@0.208.0/http/server.ts";
-import { encode as base64Encode } from "https://deno.land/std@0.208.0/encoding/base64.ts";
+#!/usr/bin/env -S deno run --allow-net --allow-env --allow-read
 
-const FE_VERSION = "prod-fe-1.0.103";
-const SIGNING_SECRET = "junjie";
+/**
+ * ZAI Proxy API - Deno Single File Edition
+ * 
+ * 一个兼容 OpenAI API 格式的 ZAI (z.ai) 代理服务
+ * 支持流式和非流式响应，支持图片上传
+ */
 
-const MODEL_MAPPING: Record<string, string> = {
-  "GLM-4.5": "0727-360B-API",
-  "GLM-4.6": "GLM-4-6-API-V1",
-};
+// ============================================================================
+// 类型定义区
+// ============================================================================
 
-async function getToken(): Promise<string> {
-  try {
-    const response = await fetch("https://chat.z.ai/api/v1/auths/");
-    const data = await response.json();
-    return data.token;
-  } catch (error) {
-    console.error("[Token Error] Exception while getting token:", error);
-    throw error;
+interface Message {
+  role: string;
+  content: string | Array<{ type: string; text?: string; image_url?: { url: string } }>;
+}
+
+interface ChatRequest {
+  model: string;
+  messages: Message[];
+  stream?: boolean;
+  temperature?: number;
+  top_p?: number;
+  max_tokens?: number;
+}
+
+interface Model {
+  id: string;
+  name: string;
+}
+
+interface Settings {
+  HOST: string;
+  PORT: number;
+  DEBUG: boolean;
+  WORKERS: number;
+  LOG_LEVEL: string;
+  PROXY_URL: string;
+  HEADERS: Record<string, string>;
+  ALLOWED_MODELS: Model[];
+  MODELS_MAPPING: Record<string, string>;
+}
+
+// ============================================================================
+// 配置区
+// ============================================================================
+
+function getSettings(): Settings {
+  return {
+    HOST: Deno.env.get("HOST") || "0.0.0.0",
+    PORT: parseInt(Deno.env.get("PORT") || "8001"),
+    DEBUG: (Deno.env.get("DEBUG") || "false").toLowerCase() === "true",
+    WORKERS: parseInt(Deno.env.get("WORKERS") || "1"),
+    LOG_LEVEL: Deno.env.get("LOG_LEVEL") || "INFO",
+    PROXY_URL: Deno.env.get("PROXY_URL") || "https://chat.z.ai",
+    HEADERS: {
+      "Accept": "*/*",
+      "Accept-Language": "zh-CN",
+      "Cache-Control": "no-cache",
+      "Connection": "keep-alive",
+      "Content-Type": "application/json",
+      "Origin": "https://chat.z.ai",
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+      "X-FE-Version": "prod-fe-1.0.98",
+    },
+    ALLOWED_MODELS: [
+      { id: "glm-4.6", name: "GLM-4.6" },
+      { id: "glm-4.5V", name: "GLM-4.5V" },
+      { id: "glm-4.5", name: "GLM-4.5" },
+      { id: "glm-4.6-search", name: "GLM-4.6-SEARCH" },
+      { id: "glm-4.6-advanced-search", name: "GLM-4.6-ADVANCED-SEARCH" },
+      { id: "glm-4.6-nothinking", name: "GLM-4.6-NOTHINKING" },
+    ],
+    MODELS_MAPPING: {
+      "glm-4.6": "GLM-4-6-API-V1",
+      "glm-4.6-nothinking": "GLM-4-6-API-V1",
+      "glm-4.6-search": "GLM-4-6-API-V1",
+      "glm-4.6-advanced-search": "GLM-4-6-API-V1",
+      "glm-4.5V": "glm-4.5v",
+      "glm-4.5": "0727-360B-API",
+    },
+  };
+}
+
+const settings = getSettings();
+
+// ============================================================================
+// 工具函数区
+// ============================================================================
+
+/**
+ * 日志记录器
+ */
+class Logger {
+  private name: string;
+
+  constructor(name: string) {
+    this.name = name;
+  }
+
+  info(message: string) {
+    console.log(`[INFO] [${this.name}] ${message}`);
+  }
+
+  error(message: string, error?: Error) {
+    console.error(`[ERROR] [${this.name}] ${message}`, error || "");
+  }
+
+  debug(message: string) {
+    if (settings.DEBUG) {
+      console.log(`[DEBUG] [${this.name}] ${message}`);
+    }
   }
 }
 
-function decodeJwtPayload(token: string): any {
-  const parts = token.split(".");
-  let payload = parts[1];
-  const padding = 4 - (payload.length % 4);
-  if (padding !== 4) payload += "=".repeat(padding);
-  
-  const decoded = atob(payload.replace(/-/g, "+").replace(/_/g, "/"));
-  return JSON.parse(decoded);
+const logger = new Logger("ZAI-Proxy");
+
+/**
+ * 生成 UUID v4
+ */
+function generateUUID(): string {
+  return crypto.randomUUID();
 }
 
-async function hmacSha256(key: string | Uint8Array, data: string): Promise<string> {
-  const keyData = typeof key === "string" ? new TextEncoder().encode(key) : key;
-  const cryptoKey = await crypto.subtle.importKey(
+/**
+ * 生成签名
+ */
+async function generateSignature(
+  t: string,
+  e: string,
+  r: number
+): Promise<{ signature: string; timestamp: number }> {
+  const timestampMs = r;
+
+  // Base64 编码 e
+  const encoder = new TextEncoder();
+  const encodedE = encoder.encode(e);
+  const b64EncodedE = btoa(String.fromCharCode(...encodedE));
+
+  // 拼接消息字符串
+  const messageString = `${t}|${b64EncodedE}|${timestampMs}`;
+
+  // 计算 n
+  const n = Math.floor(timestampMs / (5 * 60 * 1000));
+
+  // 计算中间密钥 (HMAC-SHA256)
+  const key1 = encoder.encode("key-@@@@)))()((9))-xxxx&&&%%%%%");
+  const msg1 = encoder.encode(String(n));
+
+  const cryptoKey1 = await crypto.subtle.importKey(
     "raw",
-    keyData,
+    key1,
     { name: "HMAC", hash: "SHA-256" },
     false,
     ["sign"]
   );
-  const signature = await crypto.subtle.sign(
-    "HMAC",
-    cryptoKey,
-    new TextEncoder().encode(data)
-  );
-  return Array.from(new Uint8Array(signature))
+  const intermediateKeyBuffer = await crypto.subtle.sign("HMAC", cryptoKey1, msg1);
+  const intermediateKey = Array.from(new Uint8Array(intermediateKeyBuffer))
     .map(b => b.toString(16).padStart(2, "0"))
     .join("");
+
+  // 计算最终签名 (HMAC-SHA256)
+  const key2 = encoder.encode(intermediateKey);
+  const msg2 = encoder.encode(messageString);
+
+  const cryptoKey2 = await crypto.subtle.importKey(
+    "raw",
+    key2,
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const finalSignatureBuffer = await crypto.subtle.sign("HMAC", cryptoKey2, msg2);
+  const finalSignature = Array.from(new Uint8Array(finalSignatureBuffer))
+    .map(b => b.toString(16).padStart(2, "0"))
+    .join("");
+
+  return { signature: finalSignature, timestamp: timestampMs };
 }
 
 /**
- * 生成Z.AI API双层HMAC-SHA256签名
- * 完全对照Python版本 (zai-api/src/signature.py)
- * 
- * 算法流程：
- * 1. UTF-8编码消息 → Base64编码
- * 2. 构建canonical string: "requestId,{id},timestamp,{ts},user_id,{uid}|{base64}|{ts}"
- * 3. 计算时间窗口: window = timestamp // (5 * 60 * 1000)
- * 4. 第一层HMAC: hmac_sha256(secret, window) → hex字符串
- * 5. 第二层HMAC: hmac_sha256(hex_as_utf8, canonical) → signature
+ * Base64 解码
  */
-async function generateSignature(
-  messageText: string,
-  requestId: string,
-  timestamp: number,
-  userId: string
-): Promise<string> {
-  // 1. Base64编码消息（使用Deno标准库，与Python的base64.b64encode一致）
-  const message = messageText || "";
-  const messageBytes = new TextEncoder().encode(message);
-  const messageBase64 = base64Encode(messageBytes);
-
-  // 2. 构建canonical string
-  const a = `requestId,${requestId},timestamp,${timestamp},user_id,${userId}`;
-  const canonicalString = `${a}|${messageBase64}|${timestamp}`;
-
-  // 3. 计算时间窗口（5分钟为一个窗口）
-  const windowIndex = Math.floor(timestamp / (5 * 60 * 1000));
-
-  // 4. 第一层HMAC：生成派生密钥
-  // Python: hmac.new(root_key, str(window_index).encode("utf-8"), hashlib.sha256).hexdigest()
-  const derivedHex = await hmacSha256(SIGNING_SECRET, windowIndex.toString());
-
-  // 5. 第二层HMAC：生成最终签名
-  // Python: hmac.new(derived_hex.encode("utf-8"), canonical_string.encode("utf-8"), hashlib.sha256).hexdigest()
-  const signature = await hmacSha256(derivedHex, canonicalString);
-
-  return signature;
+function base64Decode(base64: string): Uint8Array {
+  const binaryString = atob(base64);
+  const bytes = new Uint8Array(binaryString.length);
+  for (let i = 0; i < binaryString.length; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+  return bytes;
 }
 
-function extractLatestUserContent(messages: any[]): string {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i];
-    if (msg.role === "user") {
-      const content = msg.content;
-      
-      // 处理字符串内容
-      if (typeof content === "string") {
-        return content;
-      }
-      
-      // 处理数组内容（OpenAI格式，可能包含text和image_url）
-      if (Array.isArray(content)) {
-        for (const part of content) {
-          if (part.type === "text" && part.text) {
-            return part.text;
-          }
-        }
-      }
-      
-      return "";
-    }
-  }
-  return "";
+/**
+ * Base64 编码
+ */
+function base64Encode(data: Uint8Array): string {
+  const binaryString = String.fromCharCode(...data);
+  return btoa(binaryString);
 }
 
-async function makeUpstreamRequest(messages: any[], model: string) {
-  const token = await getToken();
-  const payload = decodeJwtPayload(token);
-  const userId = payload.id || `guest-user-${Math.abs(token.split("").reduce((s, c) => Math.imul(31, s) + c.charCodeAt(0) | 0, 0)) % 1000000}`;
-  const chatId = crypto.randomUUID();
-  const timestamp = Date.now();
-  const requestId = crypto.randomUUID();
+// ============================================================================
+// 图片上传类
+// ============================================================================
 
-  const targetModel = MODEL_MAPPING[model] || model;
-  const latestUserContent = extractLatestUserContent(messages);
+class ImageUploader {
+  private accessToken: string;
+  private uploadUrl: string;
 
-  // 生成签名（使用完整的签名算法）
-  const signature = await generateSignature(
-    latestUserContent,
-    requestId,
-    timestamp,
-    userId
-  );
-
-  // 调试：打印签名相关信息
-  console.log("[Signature Debug]");
-  console.log("  User Content:", latestUserContent.substring(0, 50));
-  console.log("  Request ID:", requestId);
-  console.log("  Timestamp:", timestamp);
-  console.log("  User ID:", userId);
-  console.log("  Signature:", signature);
-
-  // 生成时间字符串
-  const now = new Date();
-  const localTime = new Date(now.toLocaleString("en-US", { timeZone: "Asia/Shanghai" }));
-  const localTimeStr = `${localTime.getFullYear()}-${String(localTime.getMonth() + 1).padStart(2, "0")}-${String(localTime.getDate()).padStart(2, "0")}T${String(localTime.getHours()).padStart(2, "0")}:${String(localTime.getMinutes()).padStart(2, "0")}:${String(localTime.getSeconds()).padStart(2, "0")}.${String(localTime.getMilliseconds()).padStart(3, "0")}Z`;
-  const utcTime = now.toUTCString();
-
-  // 构建完整的查询参数（模拟真实浏览器）
-  const url = new URL("https://chat.z.ai/api/chat/completions");
-  const queryParams: Record<string, string> = {
-    timestamp: timestamp.toString(),
-    requestId: requestId,
-    user_id: userId,
-    version: "0.0.1",
-    platform: "web",
-    token: token,
-    user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    language: "zh-CN",
-    languages: "zh-CN,zh",
-    timezone: "Asia/Shanghai",
-    cookie_enabled: "true",
-    screen_width: "2048",
-    screen_height: "1152",
-    screen_resolution: "2048x1152",
-    viewport_height: "654",
-    viewport_width: "1038",
-    viewport_size: "1038x654",
-    color_depth: "24",
-    pixel_ratio: "1.25",
-    current_url: `https://chat.z.ai/c/${chatId}`,
-    pathname: `/c/${chatId}`,
-    search: "",
-    hash: "",
-    host: "chat.z.ai",
-    hostname: "chat.z.ai",
-    protocol: "https:",
-    referrer: "",
-    title: "Z.ai Chat - Free AI powered by GLM-4.6 & GLM-4.5",
-    timezone_offset: "-480",
-    local_time: localTimeStr,
-    utc_time: utcTime,
-    is_mobile: "false",
-    is_touch: "false",
-    max_touch_points: "10",
-    browser_name: "Chrome",
-    os_name: "Windows",
-    signature_timestamp: timestamp.toString(),
-  };
-
-  for (const [key, value] of Object.entries(queryParams)) {
-    url.searchParams.set(key, value);
+  constructor(accessToken: string) {
+    this.accessToken = accessToken;
+    this.uploadUrl = `${settings.PROXY_URL}/api/v1/files/`;
   }
 
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${token}`,
-      "X-Fe-Version": FE_VERSION,
-      "X-Signature": signature,
-      "Content-Type": "application/json",
-      "Accept": "*/*",
-      "Accept-Encoding": "gzip, deflate, br, zstd",
-      "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+  private getHeaders(): Record<string, string> {
+    return {
+      "Accept": "application/json",
+      "Accept-Language": "zh-CN,zh;q=0.9",
+      "Cache-Control": "no-cache",
       "Connection": "keep-alive",
       "Origin": "https://chat.z.ai",
-      "Referer": `https://chat.z.ai/c/${chatId}`,
-      "Sec-Fetch-Dest": "empty",
-      "Sec-Fetch-Mode": "cors",
-      "Sec-Fetch-Site": "same-origin",
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-      "Cache-Control": "no-cache",
-    },
-    body: JSON.stringify({
-      stream: true,
-      model: targetModel,
-      messages,
-      params: {},
-      features: {
-        image_generation: false,
-        web_search: false,
-        auto_web_search: false,
-        preview_mode: false,
-        flags: [],
-        features: [],
-        enable_thinking: false,
-      },
-      background_tasks: {
-        title_generation: false,
-        tags_generation: false,
-      },
-      mcp_servers: [],
-      variables: {
-        "{{USER_NAME}}": "Guest",
-        "{{USER_LOCATION}}": "Unknown",
-        "{{CURRENT_DATETIME}}": now.toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" }),
-        "{{CURRENT_DATE}}": now.toLocaleDateString("zh-CN", { timeZone: "Asia/Shanghai" }),
-        "{{CURRENT_TIME}}": now.toLocaleTimeString("zh-CN", { timeZone: "Asia/Shanghai" }),
-        "{{CURRENT_WEEKDAY}}": now.toLocaleDateString("zh-CN", { timeZone: "Asia/Shanghai", weekday: "long" }),
-        "{{CURRENT_TIMEZONE}}": "Asia/Shanghai",
-        "{{USER_LANGUAGE}}": "zh-CN",
-      },
-      model_item: {
-        id: targetModel,
-        name: model,
-        owned_by: "openai"
-      },
-      signature_prompt: latestUserContent, // 服务器用此字段验证签名
-      chat_id: chatId,
-      id: crypto.randomUUID(),
-    }),
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+      "authorization": `Bearer ${this.accessToken}`,
+    };
+  }
+
+  async uploadBase64Image(base64Data: string, filename?: string): Promise<string | null> {
+    try {
+      if (!filename) {
+        filename = `pasted_image_${Date.now()}.png`;
+      }
+
+      const imageData = base64Decode(base64Data);
+
+      const formData = new FormData();
+      const blob = new Blob([imageData], { type: "image/png" });
+      formData.append("file", blob, filename);
+
+      const headers = this.getHeaders();
+      delete headers["Content-Type"];
+
+      const response = await fetch(this.uploadUrl, {
+        method: "POST",
+        headers: headers,
+        body: formData,
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+
+      const result = await response.json();
+      const picId = result.id;
+      const cdnUrl = result?.meta?.cdn_url;
+
+      if (cdnUrl) {
+        logger.info(`图片上传成功: ${filename}`);
+        return picId;
+      } else {
+        logger.error("上传响应中未找到 CDN URL");
+        return null;
+      }
+    } catch (error) {
+      logger.error("图片上传失败", error as Error);
+      return null;
+    }
+  }
+
+  async uploadImageFromUrl(imageUrl: string): Promise<string | null> {
+    try {
+      const response = await fetch(imageUrl);
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+
+      const imageData = new Uint8Array(await response.arrayBuffer());
+      let filename = imageUrl.split("/").pop() || "";
+      if (!filename || !filename.includes(".")) {
+        filename = `downloaded_image_${Date.now()}.png`;
+      }
+
+      const base64Data = base64Encode(imageData);
+      return await this.uploadBase64Image(base64Data, filename);
+    } catch (error) {
+      logger.error("从 URL 上传图片失败", error as Error);
+      return null;
+    }
+  }
+}
+
+// ============================================================================
+// 消息转换与特性处理
+// ============================================================================
+
+function convertMessages(messages: Message[]): {
+  messages: Array<{ role: string; content: string }>;
+  imageUrls: string[];
+} {
+  const transMessages: Array<{ role: string; content: string }> = [];
+  const imageUrls: string[] = [];
+
+  for (const message of messages) {
+    if (typeof message.content === "string") {
+      transMessages.push({ role: message.role, content: message.content });
+    } else if (Array.isArray(message.content)) {
+      for (const part of message.content) {
+        if (part.type === "text") {
+          transMessages.push({ role: "user", content: part.text || "" });
+        } else if (part.type === "image_url") {
+          imageUrls.push(part.image_url?.url || "");
+        }
+      }
+    }
+  }
+
+  return { messages: transMessages, imageUrls };
+}
+
+function getFeatures(model: string, streaming: boolean): {
+  features: Record<string, any>;
+  mcp_servers: string[];
+} {
+  const features: Record<string, any> = {
+    image_generation: false,
+    web_search: false,
+    auto_web_search: false,
+    preview_mode: false,
+    flags: [],
+    enable_thinking: streaming,
+  };
+
+  let mcp_servers: string[] = [];
+
+  if (model === "glm-4.6-search" || model === "glm-4.6-advanced-search") {
+    features.web_search = true;
+    features.auto_web_search = true;
+    features.preview_mode = true;
+  }
+
+  if (model === "glm-4.6-nothinking") {
+    features.enable_thinking = false;
+  }
+
+  if (model === "glm-4.6-advanced-search") {
+    mcp_servers = ["advanced-search"];
+  }
+
+  return { features, mcp_servers };
+}
+
+// ============================================================================
+// 聊天处理核心逻辑
+// ============================================================================
+
+async function prepareData(
+  request: ChatRequest,
+  accessToken: string,
+  streaming = true
+): Promise<{
+  zaiData: any;
+  params: Record<string, string>;
+  headers: Record<string, string>;
+}> {
+  const convertDict = convertMessages(request.messages);
+  const zaiData: any = {
+    stream: true,
+    model: settings.MODELS_MAPPING[request.model],
+    messages: convertDict.messages,
+    chat_id: generateUUID(),
+    id: generateUUID(),
+  };
+
+  const imageUploader = new ImageUploader(accessToken);
+  const files: Array<{ type: string; id: string }> = [];
+
+  for (const url of convertDict.imageUrls) {
+    if (url.startsWith("data:image/")) {
+      const imageBase64 = url.split("base64,")[1];
+      const picId = await imageUploader.uploadBase64Image(imageBase64);
+      if (picId) files.push({ type: "image", id: picId });
+    } else if (url.startsWith("http")) {
+      const picId = await imageUploader.uploadImageFromUrl(url);
+      if (picId) files.push({ type: "image", id: picId });
+    }
+  }
+
+  zaiData.files = files;
+
+  const featuresDict = getFeatures(request.model, streaming);
+  zaiData.features = featuresDict.features;
+  if (featuresDict.mcp_servers.length > 0) {
+    zaiData.mcp_servers = featuresDict.mcp_servers;
+  }
+
+  const params = {
+    requestId: generateUUID(),
+    timestamp: String(Date.now()),
+    user_id: generateUUID(),
+  };
+
+  const t = `requestId,${params.requestId},timestamp,${params.timestamp},user_id,${params.user_id}`;
+  const e = zaiData.messages[zaiData.messages.length - 1].content;
+  const r = Date.now();
+
+  const signatureData = await generateSignature(t, e, r);
+  params.signature_timestamp = String(signatureData.timestamp);
+
+  const headers = { ...settings.HEADERS };
+  headers["Authorization"] = `Bearer ${accessToken}`;
+  headers["X-Signature"] = signatureData.signature;
+
+  return { zaiData, params, headers };
+}
+
+function createChatCompletionData(
+  content: string,
+  model: string,
+  timestamp: number,
+  phase: string,
+  usage?: any,
+  finishReason?: string | null
+): any {
+  let delta: any;
+
+  if (phase === "answer") {
+    delta = { content, role: "assistant" };
+  } else if (phase === "thinking") {
+    delta = { reasoning_content: content, role: "assistant" };
+  } else if (phase === "other" || phase === "tool_call") {
+    delta = { content, role: "assistant" };
+  } else {
+    delta = { content, role: "assistant" };
+  }
+
+  return {
+    id: `chatcmpl-${generateUUID()}`,
+    object: "chat.completion.chunk",
+    created: timestamp,
+    model,
+    choices: [{
+      index: 0,
+      delta,
+      finish_reason: finishReason || null,
+    }],
+    usage: usage || null,
+  };
+}
+
+async function* processStreamingResponse(
+  request: ChatRequest,
+  accessToken: string
+): AsyncGenerator<string> {
+  const { zaiData, params, headers } = await prepareData(request, accessToken);
+
+  const url = new URL(`${settings.PROXY_URL}/api/chat/completions`);
+  Object.entries(params).forEach(([key, value]) => url.searchParams.append(key, value));
+
+  const response = await fetch(url.toString(), {
+    method: "POST",
+    headers,
+    body: JSON.stringify(zaiData),
   });
 
   if (!response.ok) {
-    const errorText = await response.text();
-    console.error(`[Upstream Error] ${response.status} ${response.statusText}: ${errorText}`);
-    throw new Error(`Upstream API error: ${response.status} - ${errorText}`);
+    throw new Error(`HTTP error! status: ${response.status}`);
   }
 
-  return { response, model: targetModel };
-}
+  const reader = response.body?.getReader();
+  if (!reader) {
+    throw new Error("Response body is null");
+  }
 
-async function handleModels(): Promise<Response> {
-  const models = [
-    { id: "GLM-4.5", object: "model", owned_by: "z.ai" },
-    { id: "GLM-4.6", object: "model", owned_by: "z.ai" },
-  ];
-  return new Response(JSON.stringify({ object: "list", data: models }), {
-    headers: { "Content-Type": "application/json" },
-  });
-}
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const timestamp = Math.floor(Date.now() / 1000);
 
-async function handleChatCompletions(req: Request): Promise<Response> {
   try {
-    const data = await req.json();
-    const messages = data.messages || [];
-    const model = data.model || "GLM-4.6";
-    const stream = data.stream !== false; // 默认流式
-
-    const { response, model: modelName } = await makeUpstreamRequest(messages, model);
-
-  if (stream) {
-    const reader = response.body?.getReader();
-    const encoder = new TextEncoder();
-    const completionId = `chatcmpl-${crypto.randomUUID().toString().slice(0, 29)}`;
-
-    const readable = new ReadableStream({
-      async start(controller) {
-        let buffer = "";
-        let hasContent = false;
-
-        try {
-          while (true) {
-            const { done, value } = await reader!.read();
-            if (done) break;
-
-            buffer += new TextDecoder().decode(value);
-            const lines = buffer.split("\n");
-            buffer = lines.pop() || "";
-
-            for (const line of lines) {
-              if (!line.trim().startsWith("data: ")) continue;
-              const payload = line.trim().slice(6);
-              if (payload === "[DONE]") break;
-
-              try {
-                const parsed = JSON.parse(payload);
-                const dataObj = parsed.data || {};
-                const deltaContent = dataObj.delta_content || "";
-
-                if (deltaContent) {
-                  hasContent = true;
-                  const chunk = {
-                    id: completionId,
-                    object: "chat.completion.chunk",
-                    created: Math.floor(Date.now() / 1000),
-                    model: modelName,
-                    choices: [{ index: 0, delta: { content: deltaContent }, finish_reason: null }]
-                  };
-                  controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
-                }
-              } catch {}
-            }
-          }
-
-          if (!hasContent) {
-            console.error("[Stream Error] Response 200 but no content received");
-          }
-
-          const finalChunk = {
-            id: completionId,
-            object: "chat.completion.chunk",
-            created: Math.floor(Date.now() / 1000),
-            model: modelName,
-            choices: [{ index: 0, delta: {}, finish_reason: "stop" }]
-          };
-          controller.enqueue(encoder.encode(`data: ${JSON.stringify(finalChunk)}\n\n`));
-          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-        } finally {
-          controller.close();
-        }
-      },
-    });
-
-    return new Response(readable, {
-      headers: {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        "Connection": "keep-alive"
-      },
-    });
-  } else {
-    const reader = response.body?.getReader();
-    const chunks: string[] = [];
-    let buffer = "";
-
     while (true) {
-      const { done, value } = await reader!.read();
+      const { done, value } = await reader.read();
       if (done) break;
 
-      buffer += new TextDecoder().decode(value);
+      buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split("\n");
       buffer = lines.pop() || "";
 
       for (const line of lines) {
-        if (!line.trim().startsWith("data: ")) continue;
-        const payload = line.trim().slice(6);
-        if (payload === "[DONE]") break;
+        if (!line.trim()) continue;
 
-        try {
-          const parsed = JSON.parse(payload);
-          const dataObj = parsed.data || {};
-          const deltaContent = dataObj.delta_content || "";
+        if (line.startsWith("data:")) {
+          const jsonStr = line.substring(6).trim();
+          if (!jsonStr) continue;
 
-          if (deltaContent) {
-            chunks.push(deltaContent);
+          try {
+            const jsonObject = JSON.parse(jsonStr);
+            const phase = jsonObject.data?.phase;
+
+            if (phase === "thinking") {
+              let content = jsonObject.data?.delta_content || "";
+              if (content.includes("</summary>\n")) {
+                content = content.split("</summary>\n").pop() || "";
+              }
+              yield `data: ${JSON.stringify(createChatCompletionData(content, request.model, timestamp, "thinking"))}\n\n`;
+            } else if (phase === "answer") {
+              let content = "";
+              if (jsonObject.data?.edit_content && jsonObject.data.edit_content.includes("</summary>\n")) {
+                content = jsonObject.data.edit_content.split("</details>").pop() || "";
+              } else if (jsonObject.data?.delta_content) {
+                content = jsonObject.data.delta_content;
+              }
+              yield `data: ${JSON.stringify(createChatCompletionData(content, request.model, timestamp, "answer"))}\n\n`;
+            } else if (phase === "other") {
+              const usage = jsonObject.data?.usage || {};
+              const content = jsonObject.data?.delta_content || "";
+              yield `data: ${JSON.stringify(createChatCompletionData(content, request.model, timestamp, "other", usage, "stop"))}\n\n`;
+            } else if (phase === "done") {
+              yield "data: [DONE]\n\n";
+              break;
+            }
+          } catch (e) {
+            logger.error("Failed to parse JSON", e as Error);
           }
-        } catch {}
+        }
       }
     }
-
-    const fullContent = chunks.join("");
-    
-    if (!fullContent) {
-      console.error("[Non-Stream Error] Response 200 but no content received");
-    }
-
-    return new Response(JSON.stringify({
-      id: `chatcmpl-${crypto.randomUUID().toString().slice(0, 29)}`,
-      object: "chat.completion",
-      created: Math.floor(Date.now() / 1000),
-      model: modelName,
-      choices: [{
-        index: 0,
-        message: { role: "assistant", content: fullContent },
-        finish_reason: "stop"
-      }],
-    }), { headers: { "Content-Type": "application/json" } });
+  } finally {
+    reader.releaseLock();
   }
-  } catch (error) {
-    console.error("[Chat Completions Error]", error);
+}
+
+async function processNonStreamingResponse(
+  request: ChatRequest,
+  accessToken: string
+): Promise<any> {
+  const { zaiData, params, headers } = await prepareData(request, accessToken, false);
+
+  const url = new URL(`${settings.PROXY_URL}/api/chat/completions`);
+  Object.entries(params).forEach(([key, value]) => url.searchParams.append(key, value));
+
+  const response = await fetch(url.toString(), {
+    method: "POST",
+    headers,
+    body: JSON.stringify(zaiData),
+  });
+
+  if (!response.ok) {
+    throw new Error(`HTTP error! status: ${response.status}`);
+  }
+
+  const reader = response.body?.getReader();
+  if (!reader) {
+    throw new Error("Response body is null");
+  }
+
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let fullResponse = "";
+  let usage = {};
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+
+      for (const line of lines) {
+        if (!line.trim()) continue;
+
+        if (line.startsWith("data:")) {
+          const jsonStr = line.substring(6).trim();
+          if (!jsonStr) continue;
+
+          try {
+            const jsonObject = JSON.parse(jsonStr);
+            const phase = jsonObject.data?.phase;
+
+            if (phase === "answer") {
+              const content = jsonObject.data?.delta_content || "";
+              fullResponse += content;
+            } else if (phase === "other") {
+              usage = jsonObject.data?.usage || {};
+              const content = jsonObject.data?.delta_content || "";
+              fullResponse += content;
+            }
+          } catch (e) {
+            logger.error("Failed to parse JSON", e as Error);
+          }
+        }
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  return {
+    id: `chatcmpl-${generateUUID()}`,
+    object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model: request.model,
+    choices: [{
+      index: 0,
+      message: { role: "assistant", content: fullResponse },
+      finish_reason: "stop",
+    }],
+    usage,
+  };
+}
+
+// ============================================================================
+// HTTP 路由处理
+// ============================================================================
+
+function corsHeaders(): Record<string, string> {
+  return {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+  };
+}
+
+async function handleRequest(req: Request): Promise<Response> {
+  const url = new URL(req.url);
+  const pathname = url.pathname;
+
+  if (req.method === "OPTIONS") {
+    return new Response(null, { status: 200, headers: corsHeaders() });
+  }
+
+  if (pathname === "/" && req.method === "GET") {
+    return new Response("ZAI Proxy Powered by snaily", {
+      status: 200,
+      headers: {
+        ...corsHeaders(),
+        "Content-Type": "text/plain",
+        "X-Powered-By": "ZAI Proxy",
+      },
+    });
+  }
+
+  if (pathname === "/health" && req.method === "GET") {
+    return new Response(JSON.stringify({ status: "ok" }), {
+      status: 200,
+      headers: {
+        ...corsHeaders(),
+        "Content-Type": "application/json",
+      },
+    });
+  }
+
+  if (pathname === "/v1/models" && req.method === "GET") {
     return new Response(
-      JSON.stringify({
-        error: {
-          message: error instanceof Error ? error.message : "Internal server error",
-          type: "internal_error",
-        },
-      }),
+      JSON.stringify({ object: "list", data: settings.ALLOWED_MODELS, success: true }),
       {
-        status: 500,
-        headers: { "Content-Type": "application/json" },
+        status: 200,
+        headers: {
+          ...corsHeaders(),
+          "Content-Type": "application/json",
+        },
       }
     );
   }
+
+  if (pathname === "/v1/chat/completions" && req.method === "POST") {
+    try {
+      const authHeader = req.headers.get("Authorization");
+      const accessToken = authHeader ? authHeader.split(" ").pop() : null;
+
+      if (!accessToken) {
+        logger.info("No Access Token provided");
+        return new Response(
+          JSON.stringify({ message: "Unauthorized: Access token is missing" }),
+          {
+            status: 401,
+            headers: {
+              ...corsHeaders(),
+              "Content-Type": "application/json",
+            },
+          }
+        );
+      }
+
+      logger.info(`Access Token: ${accessToken}`);
+
+      const chatRequest: ChatRequest = await req.json();
+      logger.info(`Received chat completion request for model: ${chatRequest.model}`);
+
+      const allowedModelIds = settings.ALLOWED_MODELS.map(m => m.id);
+      if (!allowedModelIds.includes(chatRequest.model)) {
+        return new Response(
+          JSON.stringify({
+            message: `Model ${chatRequest.model} is not allowed. Allowed models are: ${allowedModelIds.join(", ")}`,
+          }),
+          {
+            status: 400,
+            headers: {
+              ...corsHeaders(),
+              "Content-Type": "application/json",
+            },
+          }
+        );
+      }
+
+      if (chatRequest.stream) {
+        logger.info("Streaming response");
+        const stream = new ReadableStream({
+          async start(controller) {
+            try {
+              for await (const chunk of processStreamingResponse(chatRequest, accessToken)) {
+                controller.enqueue(new TextEncoder().encode(chunk));
+              }
+              controller.close();
+            } catch (error) {
+              logger.error("Stream error", error as Error);
+              controller.error(error);
+            }
+          },
+        });
+
+        return new Response(stream, {
+          status: 200,
+          headers: {
+            ...corsHeaders(),
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+          },
+        });
+      } else {
+        logger.info("Non-streaming response");
+        const result = await processNonStreamingResponse(chatRequest, accessToken);
+        return new Response(JSON.stringify(result), {
+          status: 200,
+          headers: {
+            ...corsHeaders(),
+            "Content-Type": "application/json",
+          },
+        });
+      }
+    } catch (error) {
+      logger.error("Error processing chat completion", error as Error);
+      return new Response(
+        JSON.stringify({
+          message: "An internal server error occurred.",
+          detail: settings.DEBUG ? (error as Error).message : undefined,
+        }),
+        {
+          status: 500,
+          headers: {
+            ...corsHeaders(),
+            "Content-Type": "application/json",
+          },
+        }
+      );
+    }
+  }
+
+  return new Response("Not Found", {
+    status: 404,
+    headers: corsHeaders(),
+  });
 }
 
-async function handler(req: Request): Promise<Response> {
-  const url = new URL(req.url);
-  if (url.pathname === "/v1/models" && req.method === "GET") {
-    return await handleModels();
-  }
-  if (url.pathname === "/v1/chat/completions" && req.method === "POST") {
-    return await handleChatCompletions(req);
-  }
-  return new Response("Not Found", { status: 404 });
+// ============================================================================
+// 服务器启动
+// ============================================================================
+
+async function main() {
+  logger.info(`🚀 ZAI Proxy API starting...`);
+  logger.info(`📍 Host: ${settings.HOST}`);
+  logger.info(`🔌 Port: ${settings.PORT}`);
+  logger.info(`🐛 Debug: ${settings.DEBUG}`);
+  logger.info(`🌐 Proxy URL: ${settings.PROXY_URL}`);
+
+  await Deno.serve({
+    hostname: settings.HOST,
+    port: settings.PORT,
+    onListen: ({ hostname, port }) => {
+      logger.info(`✨ Server is listening on http://${hostname}:${port}`);
+    },
+  }, handleRequest).finished;
 }
 
-export default { fetch: handler };
+if (import.meta.main) {
+  main();
+}
